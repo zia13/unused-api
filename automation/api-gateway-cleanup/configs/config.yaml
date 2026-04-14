@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────────
+#  AWS API Gateway Unused-API Cleanup — Central Configuration
+# ─────────────────────────────────────────────────────────────────
+
+# ── Scan Settings ─────────────────────────────────────────────────
+lookback_days: 90          # Days of CloudWatch history to analyse
+low_traffic_threshold: 10  # req/day below which API is LOW_TRAFFIC
+dormant_days: 30           # Zero-traffic days before DORMANT classification
+
+# ── AWS ───────────────────────────────────────────────────────────
+dynamodb_table: api-gateway-inventory
+s3_archive_bucket: your-api-archive-bucket
+sns_topic_arn: arn:aws:sns:us-east-1:123456789012:api-gateway-orphan-alerts
+ses_sender_email: platform-engineering@yourcompany.com
+
+# ── Notification / Approval ────────────────────────────────────────
+notice_period_days: 30      # Days to wait for owner response
+escalation_days: 14         # Days before auto-escalation to team lead
+extension_allowed: true     # Allow one 30-day extension per API
+
+# ── Cleanup Safety ────────────────────────────────────────────────
+dry_run: true               # Set to false to perform real deletions
+soft_delete_window_days: 7  # Days to throttle-to-zero before hard delete
+
+# ── Excluded APIs ─────────────────────────────────────────────────
+# APIs tagged with any of these key:value pairs will never be touched
+protected_tags:
+  lifecycle: protected
+  do-not-delete: "true"
