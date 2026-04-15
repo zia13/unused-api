@@ -9,3 +9,9 @@ low_traffic_threshold  = "10"
 dry_run                = "true"
 soft_delete_window_days = "7"
 notice_period_days      = "30"
+
+# ── Test APIs ─────────────────────────────────────────────────────
+# Set to true to provision the 3 e2e test APIs (active/dormant/orphaned)
+# Set back to false (and terraform apply) to destroy them after testing
+create_test_apis       = true
+

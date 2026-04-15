@@ -625,7 +625,50 @@ ENDPOLICY
                     }
                 }
 
-                // 3-J  Smoke Checks
+                // 3-J  Provision Test APIs via Terraform + run E2E Test
+                stage('Provision Test APIs') {
+                    steps {
+                        dir('automation/api-gateway-cleanup/terraform') {
+                            sh '''
+                                terraform init -input=false -reconfigure
+                                terraform apply \
+                                  -input=false \
+                                  -auto-approve \
+                                  -var-file="terraform.tfvars" \
+                                  -var="create_test_apis=true"
+                            '''
+                        }
+                        echo "✅ 3 test APIs provisioned (active / dormant / orphaned)"
+                    }
+                }
+
+                stage('E2E Test') {
+                    steps {
+                        sh '''
+                            pip3 install --quiet boto3 pyyaml
+                            python3 automation/api-gateway-cleanup/tests/e2e_test.py \
+                              --region  "${AWS_REGION}" \
+                              --tf-dir  automation/api-gateway-cleanup/terraform
+                        '''
+                    }
+                    post {
+                        always {
+                            // Destroy the 3 test APIs via Terraform regardless of test outcome
+                            dir('automation/api-gateway-cleanup/terraform') {
+                                sh '''
+                                    terraform apply \
+                                      -input=false \
+                                      -auto-approve \
+                                      -var-file="terraform.tfvars" \
+                                      -var="create_test_apis=false" || true
+                                '''
+                            }
+                            echo "🧹 Test APIs destroyed"
+                        }
+                    }
+                }
+
+                // 3-K  Smoke Checks
                 stage('Smoke Check') {
                     steps {
                         sh '''
