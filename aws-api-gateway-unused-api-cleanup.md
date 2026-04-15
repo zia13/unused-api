@@ -765,15 +765,15 @@ aws sns subscribe \
 
 All new API Gateway APIs **must** include the following tags at creation time:
 
-| Tag Key | Example Value | Required |
-|---|---|---|
-| `owner` | `jane.doe@yourcompany.com` | ✅ Yes |
-| `team` | `payments-platform` | ✅ Yes |
-| `environment` | `production` | ✅ Yes |
-| `project` | `checkout-v2` | ✅ Yes |
-| `lifecycle` | `active` or `protected` | ✅ Yes |
-| `last-reviewed` | `2026-04-13` | ✅ Yes |
-| `cost-center` | `CC-1042` | ✅ Yes |
+| Tag Key | Example Value                        | Required |
+|---|--------------------------------------|---|
+| `owner` | `ritwik.roy@corebridgefinancial.com` | ✅ Yes |
+| `team` | `payments-platform`                  | ✅ Yes |
+| `environment` | `production`                         | ✅ Yes |
+| `project` | `checkout-v2`                        | ✅ Yes |
+| `lifecycle` | `active` or `protected`              | ✅ Yes |
+| `last-reviewed` | `2026-04-13`                         | ✅ Yes |
+| `cost-center` | `CC-1042`                            | ✅ Yes |
 
 Enforce this via an AWS Config rule:
 
