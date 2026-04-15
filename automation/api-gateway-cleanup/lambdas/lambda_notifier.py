@@ -19,7 +19,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "api-gateway-inventory")
-SES_SENDER = os.environ.get("SES_SENDER_EMAIL", "platform-engineering@yourcompany.com")
+SES_SENDER = os.environ.get("SES_SENDER_EMAIL", "mdziaur.rahman@corebridgefinancial.com")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 NOTICE_PERIOD_DAYS = int(os.environ.get("NOTICE_PERIOD_DAYS", "30"))
 ESCALATION_DAYS = int(os.environ.get("ESCALATION_DAYS", "14"))

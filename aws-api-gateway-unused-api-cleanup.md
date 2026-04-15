@@ -355,7 +355,7 @@ Actions you can take before deletion:
 
 If no response is received by <DATE + 14 days>, deletion will proceed automatically.
 
-Questions? Contact: platform-engineering@yourcompany.com
+Questions? Contact: mdziaur.rahman@corebridgefinancial.com
 ```
 
 ### 6.3 Approval Workflow
@@ -754,7 +754,7 @@ aws sns create-topic --name api-gateway-orphan-alerts
 aws sns subscribe \
   --topic-arn arn:aws:sns:<REGION>:<ACCOUNT_ID>:api-gateway-orphan-alerts \
   --protocol email \
-  --notification-endpoint platform-engineering@yourcompany.com
+  --notification-endpoint mdziaur.rahman@corebridgefinancial.com
 ```
 
 ---
@@ -919,4 +919,4 @@ done
 
 ---
 
-*Document maintained by Platform Engineering. For questions or exceptions, contact platform-engineering@yourcompany.com.*
+*Document maintained by Platform Engineering. For questions or exceptions, contact mdziaur.rahman@corebridgefinancial.com.*

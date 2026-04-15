@@ -89,8 +89,8 @@ Edit `terraform/terraform.tfvars`:
 
 ```hcl
 aws_region       = "us-east-1"
-ses_sender_email = "platform-engineering@yourcompany.com"
-sns_alert_email  = "platform-engineering@yourcompany.com"
+ses_sender_email = "mdziaur.rahman@corebridgefinancial.com"
+sns_alert_email  = "mdziaur.rahman@corebridgefinancial.com"
 dry_run          = "true"   # flip to "false" when ready for live deletions
 ```
 
