@@ -1,0 +1,765 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  AWS API Gateway Cleanup — Jenkins Provisioning Pipeline
+//  Provisions all AWS services via AWS CLI:
+//    DynamoDB · S3 · SNS · IAM Roles · Lambda x4 · Step Functions · EventBridge
+//  Jenkins agent must already have AWS CLI access (IAM role / instance profile).
+// ─────────────────────────────────────────────────────────────────────────────
+
+pipeline {
+    agent any
+
+    // ── Parameters ────────────────────────────────────────────────────────────
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['provision', 'deprovision'],
+            description: 'provision — create/update all AWS services  |  deprovision — tear everything down'
+        )
+        string(
+            name: 'AWS_REGION',
+            defaultValue: 'us-east-1',
+            description: 'AWS region to deploy into'
+        )
+        string(
+            name: 'ENVIRONMENT',
+            defaultValue: 'prod',
+            description: 'Environment tag (prod / staging / dev)'
+        )
+        string(
+            name: 'SES_SENDER_EMAIL',
+            defaultValue: 'mdziaur.rahman@corebridgefinancial.com',
+            description: 'Verified SES sender email'
+        )
+        string(
+            name: 'SNS_ALERT_EMAIL',
+            defaultValue: 'mdziaur.rahman@corebridgefinancial.com',
+            description: 'Email address to subscribe to the SNS alert topic'
+        )
+        string(
+            name: 'LOOKBACK_DAYS',
+            defaultValue: '90',
+            description: 'Days of CloudWatch history to analyse'
+        )
+        string(
+            name: 'LOW_TRAFFIC_THRESHOLD',
+            defaultValue: '10',
+            description: 'req/day below which an API is LOW_TRAFFIC'
+        )
+        string(
+            name: 'SOFT_DELETE_WINDOW_DAYS',
+            defaultValue: '7',
+            description: 'Days between soft-delete and hard-delete phases'
+        )
+        string(
+            name: 'NOTICE_PERIOD_DAYS',
+            defaultValue: '30',
+            description: 'Days to wait for owner response before escalation'
+        )
+        booleanParam(
+            name: 'DRY_RUN',
+            defaultValue: true,
+            description: 'Lambda environment flag — set false to enable real deletions'
+        )
+    }
+
+    // ── Environment ───────────────────────────────────────────────────────────
+    environment {
+        PREFIX          = 'api-gw-cleanup'
+        LAMBDAS_DIR     = 'automation/api-gateway-cleanup/lambdas'
+        BUILD_DIR       = 'automation/api-gateway-cleanup/builds'
+        RUNTIME         = 'python3.12'
+
+        // Derived names — consistent across all stages
+        DYNAMODB_TABLE  = 'api-gateway-inventory'
+        S3_BUCKET       = "api-gateway-cleanup-archive-${params.ENVIRONMENT}"
+        SNS_TOPIC_NAME  = 'api-gw-cleanup-orphan-alerts'
+        LAMBDA_ROLE     = 'api-gw-cleanup-lambda-role'
+        SFN_ROLE        = 'api-gw-cleanup-sfn-role'
+        SCHEDULER_ROLE  = 'api-gw-cleanup-scheduler-role'
+        SFN_NAME        = 'api-gw-cleanup-pipeline'
+        SCHEDULER_NAME  = 'api-gw-cleanup-weekly'
+    }
+
+    options {
+        ansiColor('xterm')
+        timestamps()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        disableConcurrentBuilds()
+    }
+
+    // ── Stages ────────────────────────────────────────────────────────────────
+    stages {
+
+        // ── 1. Checkout ───────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh "mkdir -p ${BUILD_DIR}"
+                echo "✅ Checked out — branch: ${env.GIT_BRANCH ?: 'unknown'}"
+            }
+        }
+
+        // ── 2. Verify AWS Access ──────────────────────────────────────────────
+        stage('Verify AWS Access') {
+            steps {
+                sh '''
+                    echo "── AWS identity ────────────────────────────────────────"
+                    aws sts get-caller-identity --region "${AWS_REGION}"
+                    echo "───────────────────────────────────────────────────────"
+                '''
+            }
+        }
+
+        // ── 3. Provision ──────────────────────────────────────────────────────
+        stage('Provision') {
+            when { expression { params.ACTION == 'provision' } }
+
+            stages {
+
+                // 3-A  DynamoDB
+                stage('DynamoDB Table') {
+                    steps {
+                        sh '''
+                            echo "── DynamoDB: ${DYNAMODB_TABLE} ─────────────────────────"
+
+                            # Create table only if it does not exist
+                            if aws dynamodb describe-table \
+                                   --table-name "${DYNAMODB_TABLE}" \
+                                   --region     "${AWS_REGION}" \
+                                   --output     text \
+                               > /dev/null 2>&1; then
+                                echo "  ✅ Table already exists — skipping create"
+                            else
+                                aws dynamodb create-table \
+                                    --table-name    "${DYNAMODB_TABLE}" \
+                                    --billing-mode  PAY_PER_REQUEST \
+                                    --attribute-definitions \
+                                        AttributeName=api_id,AttributeType=S \
+                                        AttributeName=region,AttributeType=S \
+                                        AttributeName=tier,AttributeType=S \
+                                    --key-schema \
+                                        AttributeName=api_id,KeyType=HASH \
+                                        AttributeName=region,KeyType=RANGE \
+                                    --global-secondary-indexes \
+                                        "[{\"IndexName\":\"tier-index\",\"KeySchema\":[{\"AttributeName\":\"tier\",\"KeyType\":\"HASH\"}],\"Projection\":{\"ProjectionType\":\"ALL\"}}]" \
+                                    --region "${AWS_REGION}"
+
+                                echo "  ⏳ Waiting for table to become ACTIVE..."
+                                aws dynamodb wait table-exists \
+                                    --table-name "${DYNAMODB_TABLE}" \
+                                    --region     "${AWS_REGION}"
+                                echo "  ✅ Table created"
+                            fi
+
+                            # Enable PITR
+                            aws dynamodb update-continuous-backups \
+                                --table-name             "${DYNAMODB_TABLE}" \
+                                --point-in-time-recovery-specification \
+                                    PointInTimeRecoveryEnabled=true \
+                                --region "${AWS_REGION}" > /dev/null
+                            echo "  ✅ Point-in-time recovery enabled"
+                        '''
+                    }
+                }
+
+                // 3-B  S3 Bucket
+                stage('S3 Archive Bucket') {
+                    steps {
+                        sh '''
+                            echo "── S3: ${S3_BUCKET} ──────────────────────────────────"
+
+                            if aws s3api head-bucket \
+                                   --bucket "${S3_BUCKET}" \
+                                   --region "${AWS_REGION}" \
+                               > /dev/null 2>&1; then
+                                echo "  ✅ Bucket already exists — skipping create"
+                            else
+                                # us-east-1 does NOT accept a LocationConstraint
+                                if [ "${AWS_REGION}" = "us-east-1" ]; then
+                                    aws s3api create-bucket \
+                                        --bucket "${S3_BUCKET}" \
+                                        --region "${AWS_REGION}"
+                                else
+                                    aws s3api create-bucket \
+                                        --bucket "${S3_BUCKET}" \
+                                        --region "${AWS_REGION}" \
+                                        --create-bucket-configuration \
+                                            LocationConstraint="${AWS_REGION}"
+                                fi
+                                echo "  ✅ Bucket created"
+                            fi
+
+                            # Versioning
+                            aws s3api put-bucket-versioning \
+                                --bucket                  "${S3_BUCKET}" \
+                                --versioning-configuration Status=Enabled \
+                                --region                  "${AWS_REGION}"
+
+                            # Server-side encryption
+                            aws s3api put-bucket-encryption \
+                                --bucket "${S3_BUCKET}" \
+                                --server-side-encryption-configuration \
+                                    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' \
+                                --region "${AWS_REGION}"
+
+                            # Block all public access
+                            aws s3api put-public-access-block \
+                                --bucket "${S3_BUCKET}" \
+                                --public-access-block-configuration \
+                                    "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" \
+                                --region "${AWS_REGION}"
+
+                            # Lifecycle: Glacier after 90 days, expire after 7 years
+                            aws s3api put-bucket-lifecycle-configuration \
+                                --bucket "${S3_BUCKET}" \
+                                --lifecycle-configuration \
+                                    '{"Rules":[{"ID":"transition-to-glacier","Status":"Enabled","Transitions":[{"Days":90,"StorageClass":"GLACIER"}],"Expiration":{"Days":2555}}]}' \
+                                --region "${AWS_REGION}"
+
+                            echo "  ✅ Versioning, encryption, public-access-block, lifecycle configured"
+                        '''
+                    }
+                }
+
+                // 3-C  SNS Topic
+                stage('SNS Topic') {
+                    steps {
+                        script {
+                            env.SNS_TOPIC_ARN = sh(
+                                script: '''
+                                    echo "── SNS: ${SNS_TOPIC_NAME} ───────────────────────────"
+
+                                    ARN=$(aws sns create-topic \
+                                              --name   "${SNS_TOPIC_NAME}" \
+                                              --region "${AWS_REGION}" \
+                                              --query  "TopicArn" \
+                                              --output text)
+                                    echo "  ✅ Topic ARN: ${ARN}"
+
+                                    # Subscribe alert email (idempotent)
+                                    aws sns subscribe \
+                                        --topic-arn "${ARN}" \
+                                        --protocol  email \
+                                        --notification-endpoint "${SNS_ALERT_EMAIL}" \
+                                        --region "${AWS_REGION}" > /dev/null
+                                    echo "  ✅ Email subscription requested: ${SNS_ALERT_EMAIL}"
+
+                                    echo "${ARN}"
+                                ''',
+                                returnStdout: true
+                            ).trim().readLines().last()
+
+                            echo "SNS_TOPIC_ARN = ${env.SNS_TOPIC_ARN}"
+                        }
+                    }
+                }
+
+                // 3-D  IAM Role for Lambda
+                stage('IAM — Lambda Role') {
+                    steps {
+                        script {
+                            env.LAMBDA_ROLE_ARN = sh(
+                                script: '''
+                                    echo "── IAM: ${LAMBDA_ROLE} ──────────────────────────────"
+
+                                    TRUST=\'{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}\'
+
+                                    # Create role (ignore AlreadyExists error)
+                                    aws iam create-role \
+                                        --role-name             "${LAMBDA_ROLE}" \
+                                        --assume-role-policy-document "${TRUST}" \
+                                        --output text > /dev/null 2>&1 || true
+
+                                    ARN=$(aws iam get-role \
+                                              --role-name "${LAMBDA_ROLE}" \
+                                              --query     "Role.Arn" \
+                                              --output    text)
+                                    echo "  ✅ Role ARN: ${ARN}"
+
+                                    POLICY=$(cat <<ENDPOLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "apigateway:GET","apigateway:DELETE","apigateway:PATCH",
+      "apigatewayv2:GET","apigatewayv2:DELETE","apigatewayv2:PATCH",
+      "cloudwatch:GetMetricStatistics","cloudwatch:ListMetrics","cloudwatch:PutMetricAlarm",
+      "logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents",
+      "logs:DescribeLogGroups","logs:StartQuery","logs:GetQueryResults",
+      "dynamodb:PutItem","dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:Scan","dynamodb:BatchWriteItem",
+      "s3:PutObject","s3:GetObject",
+      "sns:Publish",
+      "ses:SendEmail",
+      "sts:GetCallerIdentity",
+      "account:ListRegions",
+      "tag:GetResources"
+    ],
+    "Resource": "*"
+  }]
+}
+ENDPOLICY
+)
+                                    aws iam put-role-policy \
+                                        --role-name   "${LAMBDA_ROLE}" \
+                                        --policy-name "api-gw-cleanup-policy" \
+                                        --policy-document "${POLICY}"
+                                    echo "  ✅ Inline policy attached"
+
+                                    # Allow up to 15 s for IAM propagation
+                                    sleep 15
+
+                                    echo "${ARN}"
+                                ''',
+                                returnStdout: true
+                            ).trim().readLines().last()
+
+                            echo "LAMBDA_ROLE_ARN = ${env.LAMBDA_ROLE_ARN}"
+                        }
+                    }
+                }
+
+                // 3-E  Package & Deploy Lambda functions
+                stage('Lambda Functions') {
+                    steps {
+                        script {
+                            def lambdas = [
+                                [name: 'scanner',    handler: 'lambda_scanner.lambda_handler',    timeout: 900, memory: 256, extraEnv: ''],
+                                [name: 'classifier', handler: 'lambda_classifier.lambda_handler', timeout: 300, memory: 128, extraEnv: ''],
+                                [name: 'notifier',   handler: 'lambda_notifier.lambda_handler',   timeout: 300, memory: 128, extraEnv: ''],
+                                [name: 'cleaner',    handler: 'lambda_cleaner.lambda_handler',    timeout: 900, memory: 256, extraEnv: ',CLEANER_MODE=soft'],
+                            ]
+
+                            def dryRunVal = params.DRY_RUN ? 'true' : 'false'
+
+                            lambdas.each { fn ->
+                                def fnName  = "${PREFIX}-${fn.name}"
+                                def zipFile = "${BUILD_DIR}/lambda_${fn.name}.zip"
+
+                                echo "── Lambda: ${fnName} ────────────────────────────────"
+
+                                // Zip the function
+                                sh "zip -j ${zipFile} ${LAMBDAS_DIR}/lambda_${fn.name}.py"
+
+                                // Build env-vars JSON
+                                def envVars = """{
+    "DYNAMODB_TABLE":         "${DYNAMODB_TABLE}",
+    "S3_ARCHIVE_BUCKET":      "${S3_BUCKET}",
+    "SNS_TOPIC_ARN":          "${env.SNS_TOPIC_ARN}",
+    "SES_SENDER_EMAIL":       "${params.SES_SENDER_EMAIL}",
+    "LOOKBACK_DAYS":          "${params.LOOKBACK_DAYS}",
+    "LOW_TRAFFIC_THRESHOLD":  "${params.LOW_TRAFFIC_THRESHOLD}",
+    "DRY_RUN":                "${dryRunVal}",
+    "SOFT_DELETE_WINDOW_DAYS":"${params.SOFT_DELETE_WINDOW_DAYS}",
+    "NOTICE_PERIOD_DAYS":     "${params.NOTICE_PERIOD_DAYS}"
+}"""
+                                // Add CLEANER_MODE for the cleaner function
+                                if (fn.name == 'cleaner') {
+                                    envVars = """{
+    "DYNAMODB_TABLE":         "${DYNAMODB_TABLE}",
+    "S3_ARCHIVE_BUCKET":      "${S3_BUCKET}",
+    "SNS_TOPIC_ARN":          "${env.SNS_TOPIC_ARN}",
+    "SES_SENDER_EMAIL":       "${params.SES_SENDER_EMAIL}",
+    "LOOKBACK_DAYS":          "${params.LOOKBACK_DAYS}",
+    "LOW_TRAFFIC_THRESHOLD":  "${params.LOW_TRAFFIC_THRESHOLD}",
+    "DRY_RUN":                "${dryRunVal}",
+    "SOFT_DELETE_WINDOW_DAYS":"${params.SOFT_DELETE_WINDOW_DAYS}",
+    "NOTICE_PERIOD_DAYS":     "${params.NOTICE_PERIOD_DAYS}",
+    "CLEANER_MODE":           "soft"
+}"""
+                                }
+
+                                writeFile file: "${BUILD_DIR}/${fn.name}-env.json", text: envVars
+
+                                // Create or update the function
+                                def exists = sh(
+                                    script: "aws lambda get-function --function-name ${fnName} --region ${params.AWS_REGION} > /dev/null 2>&1 && echo yes || echo no",
+                                    returnStdout: true
+                                ).trim()
+
+                                if (exists == 'yes') {
+                                    sh """
+                                        aws lambda update-function-code \
+                                            --function-name "${fnName}" \
+                                            --zip-file      "fileb://${zipFile}" \
+                                            --region        "${params.AWS_REGION}" > /dev/null
+
+                                        aws lambda wait function-updated \
+                                            --function-name "${fnName}" \
+                                            --region        "${params.AWS_REGION}"
+
+                                        aws lambda update-function-configuration \
+                                            --function-name "${fnName}" \
+                                            --timeout       ${fn.timeout} \
+                                            --memory-size   ${fn.memory} \
+                                            --environment   "Variables=\$(cat ${BUILD_DIR}/${fn.name}-env.json)" \
+                                            --region        "${params.AWS_REGION}" > /dev/null
+                                    """
+                                    echo "  ✅ ${fnName} updated"
+                                } else {
+                                    sh """
+                                        aws lambda create-function \
+                                            --function-name "${fnName}" \
+                                            --runtime       "${RUNTIME}" \
+                                            --role          "${env.LAMBDA_ROLE_ARN}" \
+                                            --handler       "${fn.handler}" \
+                                            --zip-file      "fileb://${zipFile}" \
+                                            --timeout       ${fn.timeout} \
+                                            --memory-size   ${fn.memory} \
+                                            --environment   "Variables=\$(cat ${BUILD_DIR}/${fn.name}-env.json)" \
+                                            --region        "${params.AWS_REGION}" > /dev/null
+
+                                        aws lambda wait function-active \
+                                            --function-name "${fnName}" \
+                                            --region        "${params.AWS_REGION}"
+                                    """
+                                    echo "  ✅ ${fnName} created"
+                                }
+
+                                // Store ARN for later stages
+                                env["LAMBDA_ARN_${fn.name.toUpperCase()}"] = sh(
+                                    script: "aws lambda get-function-configuration --function-name ${fnName} --region ${params.AWS_REGION} --query FunctionArn --output text",
+                                    returnStdout: true
+                                ).trim()
+                            }
+                        }
+                    }
+                }
+
+                // 3-F  IAM Role for Step Functions
+                stage('IAM — Step Functions Role') {
+                    steps {
+                        script {
+                            env.SFN_ROLE_ARN = sh(
+                                script: '''
+                                    echo "── IAM: ${SFN_ROLE} ────────────────────────────────"
+
+                                    TRUST=\'{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"states.amazonaws.com"},"Action":"sts:AssumeRole"}]}\'
+
+                                    aws iam create-role \
+                                        --role-name "${SFN_ROLE}" \
+                                        --assume-role-policy-document "${TRUST}" \
+                                        --output text > /dev/null 2>&1 || true
+
+                                    ARN=$(aws iam get-role \
+                                              --role-name "${SFN_ROLE}" \
+                                              --query     "Role.Arn" \
+                                              --output    text)
+
+                                    POLICY="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"lambda:InvokeFunction\"],\"Resource\":\"*\"}]}"
+
+                                    aws iam put-role-policy \
+                                        --role-name   "${SFN_ROLE}" \
+                                        --policy-name "api-gw-cleanup-sfn-policy" \
+                                        --policy-document "${POLICY}"
+
+                                    echo "  ✅ Step Functions role ready: ${ARN}"
+                                    sleep 10
+                                    echo "${ARN}"
+                                ''',
+                                returnStdout: true
+                            ).trim().readLines().last()
+                        }
+                    }
+                }
+
+                // 3-G  Step Functions State Machine
+                stage('Step Functions State Machine') {
+                    steps {
+                        script {
+                            def softWaitSecs = (params.SOFT_DELETE_WINDOW_DAYS.toInteger() * 86400).toString()
+
+                            def definition = """{
+  "Comment": "API Gateway unused-API cleanup pipeline",
+  "StartAt": "Scan",
+  "States": {
+    "Scan": {
+      "Type": "Task",
+      "Resource": "${env.LAMBDA_ARN_SCANNER}",
+      "Next": "Classify"
+    },
+    "Classify": {
+      "Type": "Task",
+      "Resource": "${env.LAMBDA_ARN_CLASSIFIER}",
+      "Next": "Notify"
+    },
+    "Notify": {
+      "Type": "Task",
+      "Resource": "${env.LAMBDA_ARN_NOTIFIER}",
+      "Next": "WaitForSoftDeleteWindow"
+    },
+    "WaitForSoftDeleteWindow": {
+      "Type": "Wait",
+      "Seconds": ${softWaitSecs},
+      "Next": "SoftClean"
+    },
+    "SoftClean": {
+      "Type": "Task",
+      "Resource": "${env.LAMBDA_ARN_CLEANER}",
+      "Parameters": { "CLEANER_MODE": "soft" },
+      "Next": "WaitForHardDeleteWindow"
+    },
+    "WaitForHardDeleteWindow": {
+      "Type": "Wait",
+      "Seconds": 604800,
+      "Next": "HardClean"
+    },
+    "HardClean": {
+      "Type": "Task",
+      "Resource": "${env.LAMBDA_ARN_CLEANER}",
+      "Parameters": { "CLEANER_MODE": "hard" },
+      "End": true
+    }
+  }
+}"""
+                            writeFile file: "${BUILD_DIR}/sfn-definition.json", text: definition
+
+                            env.SFN_ARN = sh(
+                                script: """
+                                    echo "── Step Functions: ${SFN_NAME} ──────────────────────"
+
+                                    EXISTING=\$(aws stepfunctions list-state-machines \
+                                                   --region "${params.AWS_REGION}" \
+                                                   --query  "stateMachines[?name=='${SFN_NAME}'].stateMachineArn" \
+                                                   --output text)
+
+                                    if [ -n "\$EXISTING" ]; then
+                                        aws stepfunctions update-state-machine \
+                                            --state-machine-arn "\$EXISTING" \
+                                            --definition        file://${BUILD_DIR}/sfn-definition.json \
+                                            --role-arn          "${env.SFN_ROLE_ARN}" \
+                                            --region            "${params.AWS_REGION}" > /dev/null
+                                        echo "  ✅ State machine updated"
+                                        echo "\$EXISTING"
+                                    else
+                                        ARN=\$(aws stepfunctions create-state-machine \
+                                                   --name       "${SFN_NAME}" \
+                                                   --definition file://${BUILD_DIR}/sfn-definition.json \
+                                                   --role-arn   "${env.SFN_ROLE_ARN}" \
+                                                   --region     "${params.AWS_REGION}" \
+                                                   --query      "stateMachineArn" \
+                                                   --output     text)
+                                        echo "  ✅ State machine created: \$ARN"
+                                        echo "\$ARN"
+                                    fi
+                                """,
+                                returnStdout: true
+                            ).trim().readLines().last()
+                        }
+                    }
+                }
+
+                // 3-H  IAM Role for EventBridge Scheduler
+                stage('IAM — Scheduler Role') {
+                    steps {
+                        script {
+                            env.SCHEDULER_ROLE_ARN = sh(
+                                script: '''
+                                    echo "── IAM: ${SCHEDULER_ROLE} ──────────────────────────"
+
+                                    TRUST=\'{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}\'
+
+                                    aws iam create-role \
+                                        --role-name "${SCHEDULER_ROLE}" \
+                                        --assume-role-policy-document "${TRUST}" \
+                                        --output text > /dev/null 2>&1 || true
+
+                                    ARN=$(aws iam get-role \
+                                              --role-name "${SCHEDULER_ROLE}" \
+                                              --query     "Role.Arn" \
+                                              --output    text)
+
+                                    POLICY="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"states:StartExecution\"],\"Resource\":\"*\"}]}"
+
+                                    aws iam put-role-policy \
+                                        --role-name   "${SCHEDULER_ROLE}" \
+                                        --policy-name "api-gw-cleanup-scheduler-policy" \
+                                        --policy-document "${POLICY}"
+
+                                    echo "  ✅ Scheduler role ready: ${ARN}"
+                                    sleep 10
+                                    echo "${ARN}"
+                                ''',
+                                returnStdout: true
+                            ).trim().readLines().last()
+                        }
+                    }
+                }
+
+                // 3-I  EventBridge Scheduler (every Monday 08:00 UTC)
+                stage('EventBridge Scheduler') {
+                    steps {
+                        sh """
+                            echo "── EventBridge Scheduler: ${SCHEDULER_NAME} ─────────"
+
+                            TARGET='{
+                              "Arn":     "${env.SFN_ARN}",
+                              "RoleArn": "${env.SCHEDULER_ROLE_ARN}",
+                              "Input":   "{\\"triggered_by\\":\\"scheduler\\"}"
+                            }'
+
+                            # Try update first, create on failure
+                            if aws scheduler get-schedule \
+                                   --name   "${SCHEDULER_NAME}" \
+                                   --region "${params.AWS_REGION}" \
+                               > /dev/null 2>&1; then
+
+                                aws scheduler update-schedule \
+                                    --name                    "${SCHEDULER_NAME}" \
+                                    --schedule-expression     "cron(0 8 ? * MON *)" \
+                                    --flexible-time-window    Mode=OFF \
+                                    --target                  "\${TARGET}" \
+                                    --region                  "${params.AWS_REGION}" > /dev/null
+                                echo "  ✅ Scheduler updated"
+                            else
+                                aws scheduler create-schedule \
+                                    --name                    "${SCHEDULER_NAME}" \
+                                    --schedule-expression     "cron(0 8 ? * MON *)" \
+                                    --flexible-time-window    Mode=OFF \
+                                    --target                  "\${TARGET}" \
+                                    --region                  "${params.AWS_REGION}" > /dev/null
+                                echo "  ✅ Scheduler created (every Monday 08:00 UTC)"
+                            fi
+                        """
+                    }
+                }
+
+                // 3-J  Smoke Checks
+                stage('Smoke Check') {
+                    steps {
+                        sh '''
+                            echo "── Smoke checks ────────────────────────────────────"
+
+                            echo -n "  DynamoDB table  : "
+                            aws dynamodb describe-table \
+                                --table-name "${DYNAMODB_TABLE}" \
+                                --region     "${AWS_REGION}" \
+                                --query      "Table.TableStatus" \
+                                --output     text
+
+                            echo -n "  S3 bucket       : "
+                            aws s3api head-bucket \
+                                --bucket "${S3_BUCKET}" \
+                                --region "${AWS_REGION}" && echo "EXISTS"
+
+                            echo -n "  SNS topic       : "
+                            aws sns get-topic-attributes \
+                                --topic-arn "${SNS_TOPIC_ARN}" \
+                                --region    "${AWS_REGION}" \
+                                --query     "Attributes.TopicArn" \
+                                --output    text
+
+                            for FN in scanner classifier notifier cleaner; do
+                                echo -n "  Lambda ${FN}  : "
+                                aws lambda get-function-configuration \
+                                    --function-name "api-gw-cleanup-${FN}" \
+                                    --region        "${AWS_REGION}" \
+                                    --query         "State" \
+                                    --output        text
+                            done
+
+                            echo -n "  Step Functions  : "
+                            aws stepfunctions describe-state-machine \
+                                --state-machine-arn "${SFN_ARN}" \
+                                --region            "${AWS_REGION}" \
+                                --query             "status" \
+                                --output            text
+
+                            echo "───────────────────────────────────────────────────"
+                            echo "✅ All resources healthy"
+                        '''
+                    }
+                }
+
+            } // end nested provision stages
+        } // end Provision stage
+
+        // ── 4. Deprovision ────────────────────────────────────────────────────
+        stage('Deprovision') {
+            when { expression { params.ACTION == 'deprovision' } }
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    input message: "⚠️  This will DELETE all API Gateway Cleanup AWS resources in ${params.AWS_REGION}. Confirm?",
+                          ok: '✅ Yes, delete everything'
+                }
+                sh '''
+                    echo "── Deleting EventBridge Scheduler ──────────────────"
+                    aws scheduler delete-schedule \
+                        --name   "${SCHEDULER_NAME}" \
+                        --region "${AWS_REGION}" > /dev/null 2>&1 || echo "  (not found)"
+
+                    echo "── Deleting Step Functions state machine ────────────"
+                    SFN_ARN=$(aws stepfunctions list-state-machines \
+                                  --region "${AWS_REGION}" \
+                                  --query  "stateMachines[?name=='${SFN_NAME}'].stateMachineArn" \
+                                  --output text)
+                    [ -n "$SFN_ARN" ] && aws stepfunctions delete-state-machine \
+                        --state-machine-arn "$SFN_ARN" \
+                        --region            "${AWS_REGION}" > /dev/null || echo "  (not found)"
+
+                    echo "── Deleting Lambda functions ────────────────────────"
+                    for FN in scanner classifier notifier cleaner; do
+                        aws lambda delete-function \
+                            --function-name "api-gw-cleanup-${FN}" \
+                            --region        "${AWS_REGION}" > /dev/null 2>&1 \
+                        && echo "  deleted: api-gw-cleanup-${FN}" \
+                        || echo "  (not found: api-gw-cleanup-${FN})"
+                    done
+
+                    echo "── Detaching and deleting IAM roles ─────────────────"
+                    for ROLE in "${LAMBDA_ROLE}" "${SFN_ROLE}" "${SCHEDULER_ROLE}"; do
+                        POLICIES=$(aws iam list-role-policies \
+                                       --role-name "$ROLE" \
+                                       --query     "PolicyNames[]" \
+                                       --output    text 2>/dev/null || true)
+                        for POLICY in $POLICIES; do
+                            aws iam delete-role-policy \
+                                --role-name   "$ROLE" \
+                                --policy-name "$POLICY" > /dev/null 2>&1 || true
+                        done
+                        aws iam delete-role \
+                            --role-name "$ROLE" > /dev/null 2>&1 \
+                        && echo "  deleted role: $ROLE" \
+                        || echo "  (not found: $ROLE)"
+                    done
+
+                    echo "── Deleting SNS topic ───────────────────────────────"
+                    SNS_ARN=$(aws sns list-topics \
+                                  --region "${AWS_REGION}" \
+                                  --query  "Topics[?ends_with(TopicArn,'${SNS_TOPIC_NAME}')].TopicArn" \
+                                  --output text)
+                    [ -n "$SNS_ARN" ] && aws sns delete-topic \
+                        --topic-arn "$SNS_ARN" \
+                        --region    "${AWS_REGION}" > /dev/null \
+                    && echo "  deleted SNS topic" || echo "  (not found)"
+
+                    echo "── DynamoDB table (retained for audit) ─────────────"
+                    echo "  ⚠️  Table '${DYNAMODB_TABLE}' intentionally retained."
+                    echo "     Delete manually if needed:"
+                    echo "     aws dynamodb delete-table --table-name ${DYNAMODB_TABLE} --region ${AWS_REGION}"
+
+                    echo "── S3 bucket (retained for audit) ──────────────────"
+                    echo "  ⚠️  Bucket '${S3_BUCKET}' intentionally retained (holds archived specs)."
+                    echo "     Empty and delete manually if needed."
+
+                    echo "✅ Deprovision complete"
+                '''
+            }
+        }
+
+    } // end stages
+
+    // ── Post Actions ──────────────────────────────────────────────────────────
+    post {
+        success {
+            echo "🎉 Pipeline completed — Action: ${params.ACTION} | Region: ${params.AWS_REGION} | Env: ${params.ENVIRONMENT}"
+        }
+        failure {
+            echo "💥 Pipeline FAILED — Action: ${params.ACTION} | Region: ${params.AWS_REGION}"
+        }
+        cleanup {
+            sh "rm -rf ${BUILD_DIR} || true"
+        }
+    }
+}

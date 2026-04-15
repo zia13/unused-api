@@ -182,6 +182,65 @@ EventBridge (every Monday 08:00 UTC)
 
 ---
 
+## CI/CD — Jenkins Pipeline
+
+A `Jenkinsfile` is provided at `automation/api-gateway-cleanup/Jenkinsfile`.
+
+### Jenkins Prerequisites
+
+| Requirement | Details |
+|---|---|
+| Terraform | ≥ 1.5 installed on the Jenkins agent |
+| AWS CLI | v2 installed on the Jenkins agent |
+| Python 3 | For lambda zip packaging |
+| Jenkins plugins | *Pipeline*, *AnsiColor*, *Credentials Binding*, *Timestamper* |
+
+### Jenkins Credentials (configure in *Manage Jenkins → Credentials*)
+
+| Credential ID | Kind | Description |
+|---|---|---|
+| `aws-access-key-id` | AWS Credentials / Secret text | IAM access key ID |
+| `aws-secret-access-key` | Secret text | IAM secret access key |
+| `ses-sender-email` | Secret text | Verified SES sender address |
+| `sns-alert-email` | Secret text | SNS alert recipient address |
+
+### Pipeline Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `ACTION` | `plan` | `plan` / `apply` / `destroy` |
+| `ENVIRONMENT` | `prod` | `prod` / `staging` / `dev` |
+| `AWS_REGION` | `us-east-1` | Target AWS region |
+| `DRY_RUN` | `true` | Enable real deletions after deploy |
+| `AUTO_APPROVE` | `false` | Skip manual approval gate |
+| `LOOKBACK_DAYS` | `90` | CloudWatch history window |
+| `LOW_TRAFFIC_THRESHOLD` | `10` | req/day threshold |
+| `SOFT_DELETE_WINDOW_DAYS` | `7` | Days between soft/hard delete |
+| `NOTICE_PERIOD_DAYS` | `30` | Owner notice period |
+
+### Pipeline Stages
+
+```
+Checkout
+  └─► Validate Prerequisites   (terraform, aws cli, python3 versions + creds check)
+        └─► Generate tfvars     (writes terraform.tfvars from credentials + params)
+              └─► Terraform Init
+                    └─► Terraform Validate
+                          └─► Terraform Plan    (archives tfplan.txt as artifact)
+                                └─► Approval Gate  (manual confirm for apply/destroy)
+                                      ├─► Terraform Apply   → Smoke Test
+                                      └─► Terraform Destroy
+```
+
+### Usage
+
+1. Create a *Pipeline* job in Jenkins pointing to this repo.
+2. Add the four credentials listed above.
+3. Run with **ACTION = plan** first to preview changes.
+4. Run with **ACTION = apply** and review the approval prompt before confirming.
+
+---
+
 ## Safety Checklist
 
 Before flipping `dry_run = false`:
